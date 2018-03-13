@@ -20,19 +20,72 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func checkUser(c *gin.Context) (*db.User, error) {
+	if len(c.PostForm("user")) == 0 {
+		return nil, errors.New("No user supplied")
+	}
+
+	user := &db.User{
+		Password: c.PostForm("password"),
+	}
+	err := db.GetDB().Where(db.User{Username: c.PostForm("user")}).FirstOrCreate(&user).Error
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure passwords match
+	if user.Password != c.PostForm("password") {
+		return nil, errors.New("Incorrect password")
+	}
+
+	return user, nil
+}
+
 func nextGame(c *gin.Context) {
+	user, err := checkUser(c)
+
 	training_run := db.TrainingRun{
 		Active: true,
 	}
 	// TODO(gary): Need to set some sort of priority system here.
-	err := db.GetDB().Preload("BestNetwork").Where(&training_run).First(&training_run).Error
+	err = db.GetDB().Preload("BestNetwork").Where(&training_run).First(&training_run).Error
 	if err != nil {
 		log.Println(err)
 		c.String(http.StatusBadRequest, "Invalid training run")
 		return
 	}
 
-	// TODO: Check for active matches.
+	if user != nil {
+		var match []db.Match
+		err = db.GetDB().Preload("Candidate").Where("done=false").Limit(1).Find(&match).Error
+		if err != nil {
+			log.Println(err)
+			c.String(500, "Internal error")
+			return
+		}
+		if len(match) > 0 && !match[0].Done {
+			// Return this match
+			match_game := db.MatchGame{
+				UserID:  user.ID,
+				MatchID: match[0].ID,
+			}
+			err = db.GetDB().Create(&match_game).Error
+			if err != nil {
+				log.Println(err)
+				c.String(500, "Internal error")
+				return
+			}
+			result := gin.H{
+				"type":         "match",
+				"matchGameId":  match_game.ID,
+				"sha":          training_run.BestNetwork.Sha,
+				"candidateSha": match[0].Candidate.Sha,
+				"params":       match[0].Parameters,
+			}
+			c.JSON(http.StatusOK, result)
+			return
+		}
+	}
 
 	result := gin.H{
 		"type":       "train",
@@ -160,18 +213,10 @@ func uploadNetwork(c *gin.Context) {
 }
 
 func uploadGame(c *gin.Context) {
-	var user db.User
-	user.Password = c.PostForm("password")
-	err := db.GetDB().Where(db.User{Username: c.PostForm("user")}).FirstOrCreate(&user).Error
+	user, err := checkUser(c)
 	if err != nil {
 		log.Println(err)
-		c.String(http.StatusBadRequest, "Invalid user")
-		return
-	}
-
-	// Ensure passwords match
-	if user.Password != c.PostForm("password") {
-		c.String(http.StatusBadRequest, "Incorrect password")
+		c.String(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -256,6 +301,74 @@ func getNetwork(c *gin.Context) {
 
 	// Serve the file
 	c.File(network.Path)
+}
+
+func matchResult(c *gin.Context) {
+	user, err := checkUser(c)
+	if err != nil {
+		log.Println(err)
+		c.String(http.StatusBadRequest, err.Error())
+		return
+	}
+
+	match_game_id, err := strconv.ParseUint(c.PostForm("match_game_id"), 10, 32)
+	if err != nil {
+		log.Println(err)
+		c.String(http.StatusBadRequest, "Invalid match_game_id")
+		return
+	}
+
+	var match_game db.MatchGame
+	err = db.GetDB().Where("id = ?", match_game_id).First(&match_game).Error
+	if err != nil {
+		log.Println(err)
+		c.String(http.StatusBadRequest, "Invalid match_game")
+		return
+	}
+
+	result, err := strconv.ParseInt(c.PostForm("result"), 10, 32)
+	if err != nil {
+		log.Println(err)
+		c.String(http.StatusBadRequest, "Unable to parse result")
+		return
+	}
+
+	good_result := result == 0 || result == -1 || result == 1
+	if !good_result {
+		c.String(http.StatusBadRequest, "Bad result")
+		return
+	}
+
+	err = db.GetDB().Model(&match_game).Updates(db.MatchGame{
+		Result: int(result),
+		Done:   true,
+		Pgn:    c.PostForm("pgn"),
+	}).Error
+	if err != nil {
+		log.Println(err)
+		c.String(500, "Internal error")
+		return
+	}
+
+	col := ""
+	if result == 0 {
+		col = "draws"
+	} else if result == 1 {
+		col = "wins"
+	} else {
+		col = "losses"
+	}
+	// Atomic update of game count
+	err = db.GetDB().Exec(fmt.Sprintf("UPDATE matchs SET %s = %s + 1 WHERE id = ?", col, col), match_game.matchID).Error
+	if err != nil {
+		log.Println(err)
+		c.String(500, "Internal error")
+		return
+	}
+
+	// Now check to see if match is finished
+
+	c.String(http.StatusOK, fmt.Sprintf("Match game %d successfuly uploaded from user=%s.", match_game.ID, user.Username))
 }
 
 func getActiveUsers() ([]gin.H, error) {
@@ -434,7 +547,7 @@ func getNetworkCounts(networks []db.Network) map[uint]uint64 {
 }
 
 func viewNetworks(c *gin.Context) {
-	// TODO(gary): Whole things needs to take training_run into account...
+	// TODO(gary): Whole thing needs to take training_run into account...
 	var networks []db.Network
 	err := db.GetDB().Order("id desc").Find(&networks).Error
 	if err != nil {
@@ -535,6 +648,7 @@ func setupRouter() *gin.Engine {
 	router.POST("/next_game", nextGame)
 	router.POST("/upload_game", uploadGame)
 	router.POST("/upload_network", uploadNetwork)
+	router.POST("/match_result", matchResult)
 	return router
 }
 
